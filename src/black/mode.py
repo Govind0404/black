@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from hashlib import sha256
 from operator import attrgetter
-from typing import Final
+from typing import Final, Tuple
 
 from black.const import DEFAULT_LINE_LENGTH
 
@@ -308,7 +308,10 @@ class Mode:
         # Compactly encode plugin-related flags into this part to avoid
         # lengthening the overall cache filename with additional dot-separated fields.
         # This preserves cache correctness without exceeding filesystem limits.
-        plugin_flags = f"p{int(self.allow_plugins)}{int(self.plugins_dry_run)}{int(self.plugins_telemetry)}"
+        plugin_flags = (
+            f"p{int(self.allow_plugins)}{int(self.plugins_dry_run)}"
+            f"{int(self.plugins_telemetry)}"
+        )
         if plugin_flags != "p000":
             features_and_magics = f"{features_and_magics}+{plugin_flags}"
         if len(features_and_magics) > _MAX_CACHE_KEY_PART_LENGTH:

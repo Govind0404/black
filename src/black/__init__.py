@@ -1,12 +1,12 @@
+import importlib.metadata as _im
 import io
 import json
 import platform
 import re
 import sys
+import time
 import tokenize
 import traceback
-import time
-import importlib.metadata as _im
 from collections.abc import (
     Collection,
     Generator,
@@ -21,7 +21,7 @@ from enum import Enum
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from re import Pattern
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import click
 from click.core import ParameterSource
@@ -96,7 +96,9 @@ class BlackPluginError(Exception):
     pass
 
 
-def _discover_plugins(selected: list[str] | tuple[str, ...]) -> list[tuple[str, Any]]:
+def _discover_plugins(
+    selected: Union[List[str], Tuple[str, ...]]
+) -> List[Tuple[str, Any]]:
     """Return a list of (name, plugin_obj) in the given order.
 
     Plugins are discovered from the `black.plugins` entry point group.
@@ -109,9 +111,9 @@ def _discover_plugins(selected: list[str] | tuple[str, ...]) -> list[tuple[str, 
         eps = _im.entry_points()
         # Py311 style: object with .select; fallback to dict-like in older versions.
         if hasattr(eps, "select"):
-            group_eps = eps.select(group="black.plugins")  # type: ignore[attr-defined]
+            group_eps: Any = eps.select(group="black.plugins")
         else:  # pragma: no cover - old importlib.metadata API
-            group_eps = eps.get("black.plugins", [])  # type: ignore[assignment]
+            group_eps = eps.get("black.plugins", [])
     except Exception:
         group_eps = []
     for ep in group_eps or []:
@@ -130,7 +132,7 @@ def _discover_plugins(selected: list[str] | tuple[str, ...]) -> list[tuple[str, 
 
 def _apply_plugin_hook(
     hook: Any, name: str, text: str, mode: Mode
-) -> tuple[str, bool, str | None, float, bool]:
+) -> Tuple[str, bool, Optional[str], float, bool]:
     """Apply a single plugin hook safely.
 
     Returns: (new_text, changed, error_message, elapsed_ms, non_idempotent)
@@ -758,8 +760,8 @@ def main(  # noqa: C901
             plugins_telemetry=plugins_telemetry,
         )
         if plugins:
-            # Store plugin list on the Mode instance without making it a dataclass field
-            setattr(mode, "plugins", tuple(plugins))
+            # Store plugin list on the Mode instance
+            mode.plugins = tuple(plugins)
 
     lines: list[tuple[int, int]] = []
     if line_ranges:
@@ -1041,7 +1043,7 @@ def reformat_one(
         report.failed(src, str(exc))
 
 
-def format_file_in_place(
+def format_file_in_place(  # noqa: C901
     src: Path,
     fast: bool,
     mode: Mode,
