@@ -305,6 +305,12 @@ class Mode:
             + "@"
             + ",".join(sorted(self.python_cell_magics))
         )
+        # Compactly encode plugin-related flags into this part to avoid
+        # lengthening the overall cache filename with additional dot-separated fields.
+        # This preserves cache correctness without exceeding filesystem limits.
+        plugin_flags = f"p{int(self.allow_plugins)}{int(self.plugins_dry_run)}{int(self.plugins_telemetry)}"
+        if plugin_flags != "p000":
+            features_and_magics = f"{features_and_magics}+{plugin_flags}"
         if len(features_and_magics) > _MAX_CACHE_KEY_PART_LENGTH:
             features_and_magics = sha256(features_and_magics.encode()).hexdigest()[
                 :_MAX_CACHE_KEY_PART_LENGTH
@@ -320,10 +326,6 @@ class Mode:
             str(int(self.preview)),
             str(int(self.unstable)),
             features_and_magics,
-            # Ensure plugin-related flags influence the cache key
-            str(int(self.allow_plugins)),
-            str(int(self.plugins_dry_run)),
-            str(int(self.plugins_telemetry)),
         ]
         return ".".join(parts)
 
