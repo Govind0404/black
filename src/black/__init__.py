@@ -97,7 +97,7 @@ class BlackPluginError(Exception):
 
 
 def _discover_plugins(
-    selected: Union[List[str], Tuple[str, ...]]
+    selected: Union[List[str], Tuple[str, ...]],
 ) -> List[Tuple[str, Any]]:
     """Return a list of (name, plugin_obj) in the given order.
 
