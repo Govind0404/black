@@ -269,6 +269,10 @@ class Mode:
     preview: bool = False
     unstable: bool = False
     enabled_features: set[Preview] = field(default_factory=set)
+    # Plugin system (experimental): flags carried via Mode for easy plumbing
+    allow_plugins: bool = False
+    plugins_dry_run: bool = False
+    plugins_telemetry: bool = False
 
     def __contains__(self, feature: Preview) -> bool:
         """
@@ -316,6 +320,10 @@ class Mode:
             str(int(self.preview)),
             str(int(self.unstable)),
             features_and_magics,
+            # Ensure plugin-related flags influence the cache key
+            str(int(self.allow_plugins)),
+            str(int(self.plugins_dry_run)),
+            str(int(self.plugins_telemetry)),
         ]
         return ".".join(parts)
 

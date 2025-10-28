@@ -5,6 +5,8 @@ import re
 import sys
 import tokenize
 import traceback
+import time
+import importlib.metadata as _im
 from collections.abc import (
     Collection,
     Generator,
@@ -87,6 +89,77 @@ COMPILED = Path(__file__).suffix in (".pyd", ".so")
 FileContent = str
 Encoding = str
 NewLine = str
+
+
+# Public exception for plugin authors / failures
+class BlackPluginError(Exception):
+    pass
+
+
+def _discover_plugins(selected: list[str] | tuple[str, ...]) -> list[tuple[str, Any]]:
+    """Return a list of (name, plugin_obj) in the given order.
+
+    Plugins are discovered from the `black.plugins` entry point group.
+    Each plugin object is expected to be a mapping with optional
+    "pre_format" and/or "post_format" callables of signature (text, mode) -> text.
+    """
+    names = list(selected)
+    discovered: dict[str, Any] = {}
+    try:
+        eps = _im.entry_points()
+        # Py311 style: object with .select; fallback to dict-like in older versions.
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group="black.plugins")  # type: ignore[attr-defined]
+        else:  # pragma: no cover - old importlib.metadata API
+            group_eps = eps.get("black.plugins", [])  # type: ignore[assignment]
+    except Exception:
+        group_eps = []
+    for ep in group_eps or []:
+        try:
+            name = getattr(ep, "name", None)
+            if name in names:
+                discovered[name] = ep.load()
+        except Exception as e:  # pragma: no cover - discovery failure shouldn't crash
+            err(f"Plugin discovery error: {e}")
+    ordered: list[tuple[str, Any]] = []
+    for n in names:
+        if n in discovered:
+            ordered.append((n, discovered[n]))
+    return ordered
+
+
+def _apply_plugin_hook(
+    hook: Any, name: str, text: str, mode: Mode
+) -> tuple[str, bool, str | None, float, bool]:
+    """Apply a single plugin hook safely.
+
+    Returns: (new_text, changed, error_message, elapsed_ms, non_idempotent)
+    """
+    if not callable(hook):
+        return text, False, None, 0.0, False
+    start = time.perf_counter()
+    try:
+        new_text = hook(text, mode)
+    except BlackPluginError as e:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        return text, False, f"Plugin '{name}' error: {e}", elapsed, False
+    except Exception as e:  # quarantine arbitrary plugin failures
+        elapsed = (time.perf_counter() - start) * 1000.0
+        return text, False, f"Plugin '{name}' error: {e}", elapsed, False
+    elapsed = (time.perf_counter() - start) * 1000.0
+
+    # Idempotence check: run once more and compare
+    non_idempotent = False
+    try:
+        again = hook(text, mode)
+        if again != new_text:
+            non_idempotent = True
+    except Exception:
+        # If second run itself crashes, treat as non-idempotent behavior
+        non_idempotent = True
+
+    changed = new_text != text
+    return new_text, changed, None, elapsed, non_idempotent
 
 
 class WriteBack(Enum):
@@ -475,6 +548,36 @@ def validate_regex(
         " detailing which one it is using will be emitted."
     ),
 )
+@click.option(
+    "--allow-plugins",
+    is_flag=True,
+    help=(
+        "Allow running third-party plugins registered via the 'black.plugins' entry"
+        " point group. Plugin names can be listed in [tool.black].plugins in"
+        " pyproject.toml or passed via --plugins."
+    ),
+)
+@click.option(
+    "--plugins-dry-run",
+    is_flag=True,
+    help=(
+        "Run plugins but do not write plugin-induced changes. Instead, print a"
+        " summary of changes per plugin."
+    ),
+)
+@click.option(
+    "--plugins-telemetry",
+    is_flag=True,
+    help="Print basic timing telemetry for plugins.",
+)
+@click.option(
+    "--plugins",
+    multiple=True,
+    help=(
+        "Names of plugins to enable in the order they should run. Can also be"
+        " provided via [tool.black].plugins in pyproject.toml."
+    ),
+)
 @click.version_option(
     version=__version__,
     message=(
@@ -535,6 +638,10 @@ def main(  # noqa: C901
     enable_unstable_feature: list[Preview],
     quiet: bool,
     verbose: bool,
+    allow_plugins: bool,
+    plugins_dry_run: bool,
+    plugins_telemetry: bool,
+    plugins: tuple[str, ...],
     required_version: Optional[str],
     include: Pattern[str],
     exclude: Optional[Pattern[str]],
@@ -642,6 +749,17 @@ def main(  # noqa: C901
         python_cell_magics=set(python_cell_magics),
         enabled_features=set(enable_unstable_feature),
     )
+    # Carry plugin flags via Mode for downstream formatting functions
+    if allow_plugins or plugins or plugins_dry_run or plugins_telemetry:
+        mode = replace(
+            mode,
+            allow_plugins=allow_plugins,
+            plugins_dry_run=plugins_dry_run,
+            plugins_telemetry=plugins_telemetry,
+        )
+        if plugins:
+            # Store plugin list on the Mode instance without making it a dataclass field
+            setattr(mode, "plugins", tuple(plugins))
 
     lines: list[tuple[int, int]] = []
     if line_ranges:
@@ -948,31 +1066,112 @@ def format_file_in_place(
     with open(src, "rb") as buf:
         if mode.skip_source_first_line:
             header = buf.readline()
-        src_contents, encoding, newline = decode_bytes(buf.read(), mode)
+        src_body, encoding, newline = decode_bytes(buf.read(), mode)
+    # Preserve original full text for change detection and diffing
+    original_full_text = header.decode(encoding) + src_body
+
+    # Plugins: discover and run if enabled
+    plugin_enabled = bool(
+        getattr(mode, "allow_plugins", False) and getattr(mode, "plugins", ())
+    )
+    plugins_loaded: list[tuple[str, Any]] = (
+        _discover_plugins(list(getattr(mode, "plugins", ()))) if plugin_enabled else []
+    )
+    # Accumulators for reporting
+    change_counts: dict[str, int] = {name: 0 for name, _ in plugins_loaded}
+    timings_ms: dict[str, float] = {name: 0.0 for name, _ in plugins_loaded}
+    non_idempotent: set[str] = set()
+    errors: list[str] = []
+
+    working_src = src_body
+    # Pre-format hooks
+    if plugins_loaded:
+        for name, plugin in plugins_loaded:
+            hook = (
+                plugin.get("pre_format")
+                if hasattr(plugin, "get")
+                else getattr(plugin, "pre_format", None)
+            )
+            working_src2, changed, err_msg, elapsed_ms, non_idem = _apply_plugin_hook(
+                hook, name, working_src, mode
+            )
+            if err_msg:
+                errors.append(err_msg)
+            if changed:
+                change_counts[name] += 1
+            timings_ms[name] = timings_ms.get(name, 0.0) + elapsed_ms
+            if non_idem:
+                non_idempotent.add(name)
+            working_src = working_src2
+
+    # Core formatting
     try:
-        dst_contents = format_file_contents(
-            src_contents, fast=fast, mode=mode, lines=lines
+        dst_contents_core = format_file_contents(
+            working_src, fast=fast, mode=mode, lines=lines
         )
     except NothingChanged:
-        return False
+        # Even if core made no changes, we may still need to run post hooks
+        dst_contents_core = working_src
     except JSONDecodeError:
         raise ValueError(
             f"File '{src}' cannot be parsed as valid Jupyter notebook."
         ) from None
-    src_contents = header.decode(encoding) + src_contents
-    dst_contents = header.decode(encoding) + dst_contents
 
-    if write_back == WriteBack.YES:
+    # Post-format hooks
+    working_dst = dst_contents_core
+    if plugins_loaded:
+        for name, plugin in plugins_loaded:
+            hook = (
+                plugin.get("post_format")
+                if hasattr(plugin, "get")
+                else getattr(plugin, "post_format", None)
+            )
+            working_dst2, changed, err_msg, elapsed_ms, non_idem = _apply_plugin_hook(
+                hook, name, working_dst, mode
+            )
+            if err_msg:
+                errors.append(err_msg)
+            if changed:
+                change_counts[name] += 1
+            timings_ms[name] = timings_ms.get(name, 0.0) + elapsed_ms
+            if non_idem:
+                non_idempotent.add(name)
+            working_dst = working_dst2
+
+    # Reporting for plugins
+    if plugins_loaded:
+        for msg in errors:
+            err(msg)
+        for name in sorted(non_idempotent):
+            err(f"Plugin '{name}' produced non-idempotent output")
+        if getattr(mode, "plugins_telemetry", False):
+            for name, _ in plugins_loaded:
+                out(f"Plugin {name}: {timings_ms.get(name, 0.0):.1f} ms")
+        if getattr(mode, "plugins_dry_run", False):
+            for name, _ in plugins_loaded:
+                out(f"Plugin {name}: {change_counts.get(name, 0)} change(s)")
+            # In dry-run, do not write any changes
+            return False
+
+    # Reconstruct final full text and detect changes
+    final_full_text = header.decode(encoding) + working_dst
+    changed = final_full_text != original_full_text
+
+    if write_back == WriteBack.YES and changed:
         with open(src, "w", encoding=encoding, newline=newline) as f:
-            f.write(dst_contents)
-    elif write_back in (WriteBack.DIFF, WriteBack.COLOR_DIFF):
+            f.write(final_full_text)
+    elif write_back in (WriteBack.DIFF, WriteBack.COLOR_DIFF) and changed:
         now = datetime.now(timezone.utc)
         src_name = f"{src}\t{then}"
         dst_name = f"{src}\t{now}"
         if mode.is_ipynb:
-            diff_contents = ipynb_diff(src_contents, dst_contents, src_name, dst_name)
+            diff_contents = ipynb_diff(
+                original_full_text, final_full_text, src_name, dst_name
+            )
         else:
-            diff_contents = diff(src_contents, dst_contents, src_name, dst_name)
+            diff_contents = diff(
+                original_full_text, final_full_text, src_name, dst_name
+            )
 
         if write_back == WriteBack.COLOR_DIFF:
             diff_contents = color_diff(diff_contents)
@@ -988,7 +1187,7 @@ def format_file_in_place(
             f.write(diff_contents)
             f.detach()
 
-    return True
+    return changed
 
 
 def format_stdin_to_stdout(
