@@ -1,25 +1,19 @@
-# Black plugin pipeline (project‑scoped, opt‑in)
+## Problem Brief
 
-Projects sometimes need safe, local rewrites during formatting: migrating APIs, enforcing naming, or inserting headers. Add an opt‑in plugin pipeline around Black’s core formatter that runs only when explicitly enabled and never changes Black’s style rules.
+Introduce an opt‑in, project‑scoped plugin pipeline around Black’s core formatter to enable safe, local source rewrites (for example, API migrations, naming normalization, or standard headers). Plugins must never alter Black’s style rules and run only when explicitly enabled. Execution order is deterministic and exactly matches configuration. Transforms are expected to be pure, deterministic, and effectively idempotent; validate idempotence where practical. Quarantine plugin failures: report them and skip the offending step so the formatter can still succeed. Provide a dry‑run mode that prints concise per‑plugin change summaries, and an optional telemetry mode that exposes basic timing. When plugins are disabled, output is identical to baseline Black. The feature is additive, keeps overhead modest, and behaves consistently across supported Python versions and platforms.
 
-Requirements
-- Opt‑in gate: plugins run only with an explicit flag.
-- Deterministic order: execute plugins exactly as configured.
-- Hooks: support pre_format and post_format transforms with signature (source: str, mode: black.Mode) -> str.
-- Discovery and config: discover by entry point group black.plugins; allow configuration via [tool.black].plugins and equivalent CLI.
-- Guarantees: transforms must be pure, deterministic, and effectively idempotent; validate where practical.
-- Isolation and failure policy: quarantine plugin errors (report, skip) so core formatting still succeeds; do not crash or change exit status if the formatter itself succeeds.
-- Dry‑run and telemetry: provide a dry‑run mode that prints per‑plugin change summaries; optionally print basic per‑plugin timing.
-- No style changes: core formatting output must be identical when plugins are disabled; with plugins enabled, preserve Black’s invariants.
-- Cross‑platform behavior: consistent across supported Python versions and OSes.
+## Agent Instructions
 
-CLI and configuration
-- Flag to enable plugins, plus options for dry‑run and telemetry.
-- Ordered plugin list via [tool.black].plugins or CLI to define execution order.
+- Add a plugin pipeline that executes only when explicitly enabled.
+- Execute plugins in a stable, configured order.
+- Support two hooks: pre_format and post_format with signature (source: str, mode: black.Mode) -> str.
+- Discover plugins via the entry point group black.plugins; allow configuration via [tool.black].plugins and equivalent CLI flags.
+- Enforce purity, determinism, and effective idempotence; warn on non‑idempotence.
+- Quarantine plugin errors (report + skip) without failing the overall run when core formatting succeeds.
+- Provide dry‑run change summaries per plugin and optional timing telemetry.
+- Preserve Black’s formatting invariants and change‑detection/diff semantics.
 
-Error handling and reporting
-- Surface plugin errors and non‑idempotence warnings in stderr/summary.
-- Summaries should indicate each plugin’s name and number of changes.
+## Test Assumptions (optional)
 
-Scope
-- Keep overhead modest. The feature is additive and fully disabled by default.
+- Public surfaces introduced: entry point group black.plugins; configuration key [tool.black].plugins (ordered list); CLI gates to enable plugins, dry‑run, and telemetry.
+- Hooks: pre_format and post_format accept (source: str, mode: black.Mode) and return a new source string.
